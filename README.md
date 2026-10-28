@@ -1,16 +1,55 @@
 # RADEN01
 
-Qwen multi-agent market monitoring and paper-trading research.
+Qwen を利用した Raw Data First の市場観測・ペーパートレード研究基盤。
+Python 3.11 以上。実売買の注文経路はありません。既定は合成データと模擬判断です。
 
-## Scope
-- Raw market data first, with source timestamps and minimal transformation.
-- Role-specialized Qwen agents for monitoring, entry, and exit decisions.
-- Two input modes: live market feed (subject to provider terms) and chronological CSV replay.
-- Paper trading only by default; no live order placement.
-- Evaluate inference latency, execution assumptions, fills, slippage, and P&L.
+## セットアップと実行
 
-## Status
-Initial repository bootstrap. Implementation and infrastructure setup pending.
+```sh
+cd /workspace/RADEN01
+python -m venv .venv
+.venv/bin/python -m pip install -e .
+.venv/bin/python -m unittest discover -s tests -v
+.venv/bin/raden examples/synthetic.csv --output logs/demo.jsonl
+```
 
-## Data and security
-Never commit broker credentials, account details, paid market data, or raw proprietary market feeds. Use permitted synthetic fixtures for public tests.
+出力先は新規ファイルを指定してください。既存ログは上書きしません。
+同梱データでは 101 で 1 単位買い、104 で売り、損益は 3（手数料なし）になります。
+テストと模擬実行には GPU、API キー、外部サービスは不要です。
+
+## 構成
+
+- `core.MarketDataSource`: データ取得を交換する境界。kabu ステーションの将来のアダプターも `MarketEvent` を時系列順に配信します。現時点で接続実装はありません。
+- `core.CSVReplay`: CSV をストリームで配信。必須列は `timestamp,symbol,price`。タイムゾーン付き時刻と正の有限価格を要求し、逆順の入力はエラーにします。同一時刻は元の行順です。
+- `core.ROLES`: 銘柄ごとに 10 の役割を実行。現在は逐次実行し、並列推論やエージェント間会話は行いません。各役割には同一銘柄の現在行までの履歴だけを渡します。
+- `qwen.QwenBackend`: OpenAI 互換 Chat Completions API による Qwen 推論。直近 100 イベントの生フィールドを渡し、JSON の判断を検証します。失敗した判断は hold としてログに残します。
+- `core.PaperBroker`: 仮想現金、保有数量、平均取得原価、実現・未実現損益、注文状態を管理。
+
+CSV の全列は文字列として保持します。時刻・約定価格は配信順序の検証と仮想会計のために別途解釈します。正規化、補間、リサンプリング、指標や特徴量の生成は行いません。
+同時刻の行は逐次見えるため、同時刻の完全なスナップショットを意味しません。履歴は現在メモリに保持するため、大規模リプレイ向けの保存・容量制限は今後の課題です。
+
+## Qwen を利用する場合
+
+Qwen を提供する互換サーバーを別途用意し、環境変数を設定してください。
+`.env.example` は項目の例で、自動読み込みはしません。
+
+```sh
+export QWEN_ENDPOINT=http://127.0.0.1:8000/v1/chat/completions
+export QWEN_MODEL=Qwen/Qwen3-8B
+# 必要な場合は QWEN_API_KEY を安全な環境設定から注入
+.venv/bin/raden examples/synthetic.csv --backend qwen --output logs/qwen-demo.jsonl
+```
+
+リモート接続には HTTPS を要求します。モデル、サーバー、GPU、ネットワーク許可は提供先に応じて用意してください。Qwen 実モデルの精度・応答速度は未検証です。外部 API モードでは入力データが指定先へ送信されるため、利用許諾のあるデータだけを使用してください。
+
+## 判断・注文・評価のルール
+
+10 役割の buy と sell の票数を比較し、多い側へ 1 単位の仮想注文を出します。同票または全 hold なら注文しません。これは動作確認用の単純な集約で、検証済みの投資戦略ではありません。MockBackend は最初の行で買い、3 行目で売る固定動作です。
+
+注文は同一銘柄で **厳密に後の時刻** の次イベントの価格で約定します。同一行・同一時刻の約定はありません。買付余力不足と空売りは拒否します。最終行の未約定注文は pending のまま残し、強制決済しません。評価額は銘柄ごとの最終観測価格で計算します。手数料、スリッページ、板の厚み、部分約定、営業日、売買単位、推論の実時間に伴う遅延は未モデル化です。再現テスト向けの簡略約定モデルです。
+
+JSONL ログには原データ、各役割の判断と推論時間、仮想注文、約定・拒否、現金・保有・損益を記録します。実測推論時間は記録のみで、リプレイ時計は進めません。障害時は既に出力したログを保持し、コマンドは失敗します。
+
+## データ管理
+
+ブローカー認証情報、口座情報、有料市場データ、実際の非公開フィードをコミットしないでください。`examples/` は合成データのみです。実データは既存の除外対象 `data/raw/`、`data/private/` を使用し、ログも Git 管理対象外です。
