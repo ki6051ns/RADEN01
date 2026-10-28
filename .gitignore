@@ -10,3 +10,8 @@ data/raw/
 data/private/
 *.sqlite3
 *.db
+*.egg-info/
+build/
+dist/
+.venv-vllm/
+models/
