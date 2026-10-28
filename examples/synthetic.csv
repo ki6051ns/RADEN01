@@ -1,0 +1,5 @@
+timestamp,symbol,price,volume,source
+2026-01-05T09:00:00+09:00,DEMO,100,10,synthetic
+2026-01-05T09:00:01+09:00,DEMO,101,20,synthetic
+2026-01-05T09:00:02+09:00,DEMO,103,15,synthetic
+2026-01-05T09:00:03+09:00,DEMO,104,30,synthetic
