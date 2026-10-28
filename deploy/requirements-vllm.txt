@@ -1,0 +1,2 @@
+# Install in a separate Linux NVIDIA GPU environment, not the replay virtualenv.
+vllm==0.11.0

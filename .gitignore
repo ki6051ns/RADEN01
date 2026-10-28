@@ -13,3 +13,5 @@ data/private/
 *.egg-info/
 build/
 dist/
+.venv-vllm/
+models/

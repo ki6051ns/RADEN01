@@ -10,6 +10,8 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Iterable, Mapping, Protocol, TextIO
 
+from .prompts import PROMPT_VERSION, ROLE_PROMPTS
+
 
 def positive_price(value: str) -> Decimal:
     price = Decimal(value)
@@ -23,6 +25,7 @@ class MarketEvent:
     timestamp: datetime
     symbol: str
     raw: Mapping[str, str]
+    execution_price: Decimal | None = None
 
     def __post_init__(self):
         if self.timestamp.tzinfo is None or self.timestamp.utcoffset() is None:
@@ -33,7 +36,7 @@ class MarketEvent:
 
 
 class MarketDataSource(Protocol):
-    """A future kabu feed implements this interface; it never submits orders."""
+    """Read-only event stream shared by CSV replay and kabu board polling."""
 
     def __iter__(self) -> Iterable[MarketEvent]: ...
 
@@ -65,9 +68,13 @@ class CSVReplay:
 class Decision:
     action: str
     reason: str
+    input_tokens: int | None = None
+    token_source: str = "unavailable"
+    model: str = "custom"
+    status: str = "ok"
 
     def __post_init__(self):
-        if self.action not in {"buy", "sell", "hold"} or not isinstance(self.reason, str):
+        if self.action not in {"buy", "sell", "hold"} or not isinstance(self.reason, str) or len(self.reason) > 2000:
             raise ValueError("invalid decision")
 
 
@@ -75,11 +82,7 @@ class DecisionBackend(Protocol):
     def decide(self, role: str, history: tuple[MarketEvent, ...]) -> Decision: ...
 
 
-ROLES = (
-    "market-observer", "liquidity-observer", "volume-observer", "price-observer",
-    "entry-reviewer", "exit-reviewer", "risk-reviewer", "execution-reviewer",
-    "counterargument-reviewer", "portfolio-reviewer",
-)
+ROLES = tuple(ROLE_PROMPTS)
 
 
 @dataclass
@@ -92,7 +95,11 @@ class MockBackend:
             action = "buy"
         elif role == "exit-reviewer" and len(history) == 3:
             action = "sell"
-        return Decision(action, "synthetic replay fixture")
+        from .prompts import messages
+        # A byte estimate is deliberately not presented as Qwen tokenizer usage.
+        size = len(json.dumps(messages(role, history, 100), ensure_ascii=False).encode())
+        return Decision(action, "synthetic replay fixture", (size + 3) // 4,
+                        "mock_utf8_bytes_div4_estimate", "mock")
 
 
 @dataclass
@@ -111,7 +118,7 @@ class PaperBroker:
         self.initial_cash = self.cash
 
     def on_event(self, event: MarketEvent) -> list[dict]:
-        price = positive_price(event.raw["price"])
+        price = positive_price(str(event.execution_price)) if event.execution_price is not None else positive_price(event.raw["price"])
         self.marks[event.symbol] = price
         results = []
         remaining = []
@@ -140,6 +147,8 @@ class PaperBroker:
         return results
 
     def submit(self, event, action):
+        if action not in {"buy", "sell"}:
+            raise ValueError("paper order must be buy or sell")
         order = {"id": self._next_id(), "symbol": event.symbol, "action": action,
                  "quantity": 1, "submitted_at": event.timestamp}
         self.pending.append(order)
@@ -166,7 +175,9 @@ def json_default(value):
 
 
 def run(source: MarketDataSource, backend: DecisionBackend, output: TextIO,
-        broker: PaperBroker | None = None):
+        broker: PaperBroker | None = None, context_events: int = 100):
+    if context_events < 1:
+        raise ValueError("context_events must be positive")
     broker = broker if broker is not None else PaperBroker()
     histories: dict[str, list[MarketEvent]] = {}
     previous = None
@@ -185,19 +196,29 @@ def run(source: MarketDataSource, backend: DecisionBackend, output: TextIO,
             write(execution)
         history = histories.setdefault(event.symbol, [])
         history.append(event)
+        # Retain only a bounded raw prefix window per symbol.
+        if len(history) > context_events:
+            del history[:-context_events]
         decisions = []
         for role in ROLES:
             started = time.monotonic()
             try:
-                decision = backend.decide(role, tuple(history))
+                if hasattr(backend, "decide_with_state"):
+                    decision = backend.decide_with_state(role, tuple(history), broker.valuation())
+                else:
+                    decision = backend.decide(role, tuple(history))
                 if not isinstance(decision, Decision):
                     raise ValueError("backend must return Decision")
             except Exception as error:
                 # Do not log exception text: remote responses may contain secrets.
-                decision = Decision("hold", "backend error: " + type(error).__name__)
+                decision = Decision("hold", "backend error: " + type(error).__name__,
+                                    model=getattr(backend, "model", "custom"), status="error")
             decisions.append(decision)
             write({"type": "decision", "timestamp": event.timestamp, "symbol": event.symbol,
                    "agent": role, "action": decision.action, "reason": decision.reason,
+                   "prompt_version": PROMPT_VERSION, "model": decision.model,
+                   "input_tokens": decision.input_tokens, "token_source": decision.token_source,
+                   "status": decision.status, "context_events": len(history),
                    "latency_ms": (time.monotonic() - started) * 1000})
         # One paper order per symbol/event. Ties and all-hold mean no order.
         buys = sum(d.action == "buy" for d in decisions)
